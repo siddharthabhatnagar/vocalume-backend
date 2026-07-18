@@ -233,11 +233,18 @@ vercel --prod
 
 ### About `vercel.json`
 
+- This project uses the modern `functions` + `rewrites` config rather than
+  the legacy `builds`/`routes` config -- Vercel does not allow `builds` and
+  `functions` to be specified in the same `vercel.json` (you'll get a
+  "The `functions` property cannot be used in conjunction with the `builds`
+  property" error if you mix them). `rewrites` sends all incoming paths to
+  the `api/index.py` serverless function, and `functions` configures that
+  function's `maxDuration` and `includeFiles`.
 - `includeFiles: "**/*.py"` is used deliberately instead of `"app/**"` --
   the latter glob pattern has been unreliable in practice for bundling
   nested Python packages with `@vercel/python`, sometimes silently dropping
   files. `**/*.py` reliably includes every Python module in the project.
-- The `env` block does **not** reference `@secrets` (e.g.
+- There is no `env` block referencing `@secrets` (e.g.
   `"CEREBRAS_API_KEY": "@cerebras-api-key"`). Vercel Secrets are a separate,
   legacy mechanism from regular project environment variables, and
   referencing a `@secret` that hasn't been separately created causes a
