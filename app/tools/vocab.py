@@ -1,90 +1,77 @@
-"""Vocabulary extraction tool."""
-from __future__ import annotations
+"""
+Vocabulary extraction tool.
 
-import json
-import logging
-import re
-from typing import Any
-
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from app.schemas import VocabItem, VocabularyFeedback
-from app.services.nim_llm import get_analyzer_chat
-
-log = logging.getLogger(__name__)
-
-SYSTEM_PROMPT = """You are a vocabulary coach for English learners.
-
-You will receive ONE user utterance. Identify any advanced words, idiomatic
-phrases, or collocations the learner used (or could have used). Also suggest
-2-3 more idiomatic or natural alternative phrasings of the same idea.
-
-Output ONLY a JSON object with this exact shape — no markdown fences, no commentary:
-
-{
-  "new_words": [
-    {"word": "<the word or phrase>", "definition": "<short def in context>", "synonyms": ["<syn1>", "<syn2>"]}
-  ],
-  "suggestions": ["<a more idiomatic alternative phrasing>", "<another alternative>"]
-}
-
-Rules:
-- Only include words that are genuinely worth learning (CEFR B2+ level).
-- If the utterance is too simple to extract anything, return empty arrays.
-- Suggestions should preserve the user's meaning, not change it.
-- Maximum 5 new_words and 3 suggestions.
+Uses the Cerebras analyzer chat to surface vocabulary-building
+opportunities from a learner's transcript: notable/advanced words the
+learner used correctly (worth reinforcing with a definition and
+synonyms), plus a short list of suggested alternative words or phrases
+the learner could use to sound more natural or precise. As with the
+grammar tool, the prompt strictly demands JSON-only output and parsing
+is tolerant of markdown code fences or minor formatting noise. Any
+failure (bad JSON, LLM/network error) degrades gracefully to an empty
+`VocabularyFeedback` rather than raising, so the conversation pipeline
+keeps flowing even if this tool has a transient failure.
 """
 
+import json
+import re
 
-def _strip_code_fence(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*\n", "", text)
-        text = re.sub(r"\n```\s*$", "", text)
-    return text.strip()
+from app.schemas import VocabItem, VocabularyFeedback
+from app.services.cerebras_llm import get_analyzer_chat
+
+_SYSTEM_PROMPT = """You are a vocabulary-building assistant for an English-learning app.
+Given a learner's spoken utterance (transcribed to text), identify up to 5 notable words the learner used well (worth reinforcing), and suggest up to 3 alternative words or phrases that could make their speech more natural or precise.
+
+Output ONLY a JSON object -- no markdown fences, no commentary. The JSON must have this exact shape:
+{
+  "new_words": [
+    {"word": "<word>", "definition": "<short, simple definition>", "synonyms": ["<synonym1>", "<synonym2>"]}
+  ],
+  "suggestions": ["<alternative word or phrase suggestion>"]
+}
+
+Limit new_words to at most 5 items and suggestions to at most 3 items. If nothing notable stands out, return empty lists."""
 
 
-def _safe_parse(raw: str) -> dict[str, Any]:
-    cleaned = _strip_code_fence(raw)
+def _extract_json(raw: str) -> dict:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+        cleaned = re.sub(r"```$", "", cleaned).strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                pass
-    return {}
+            return json.loads(match.group(0))
+        raise
 
 
 async def extract_vocabulary(transcript: str) -> VocabularyFeedback:
-    transcript = transcript.strip()
-    if not transcript:
-        return VocabularyFeedback()
+    """Run the vocabulary-extraction LLM call and return structured feedback.
 
-    chat = get_analyzer_chat()
+    Never raises: on any failure, returns an empty VocabularyFeedback.
+    """
     try:
+        chat = get_analyzer_chat()
         response = await chat.ainvoke(
-            [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=f'Utterance: "{transcript}"')]
+            [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": transcript},
+            ]
         )
-        raw = response.content if isinstance(response.content, str) else str(response.content)
-        data = _safe_parse(raw)
+        parsed = _extract_json(response.content)
 
-        new_words: list[VocabItem] = []
-        for raw_w in (data.get("new_words") or [])[:5]:
-            if not isinstance(raw_w, dict) or not raw_w.get("word"):
-                continue
-            new_words.append(
-                VocabItem(
-                    word=raw_w["word"],
-                    definition=raw_w.get("definition", ""),
-                    synonyms=raw_w.get("synonyms", []) or [],
-                )
+        new_words = [
+            VocabItem(
+                word=w.get("word", ""),
+                definition=w.get("definition", ""),
+                synonyms=list(w.get("synonyms", []))[:5],
             )
+            for w in parsed.get("new_words", [])[:5]
+        ]
+        suggestions = [str(s) for s in parsed.get("suggestions", [])[:3]]
 
-        suggestions = [s for s in (data.get("suggestions") or []) if isinstance(s, str)][:3]
         return VocabularyFeedback(new_words=new_words, suggestions=suggestions)
-    except Exception as exc:
-        log.warning("Vocabulary extraction failed: %s", exc)
-        return VocabularyFeedback()
+    except Exception:
+        return VocabularyFeedback(new_words=[], suggestions=[])

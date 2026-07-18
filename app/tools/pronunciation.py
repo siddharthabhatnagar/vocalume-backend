@@ -1,25 +1,30 @@
-"""Pronunciation scoring tool.
-
-⚠️ On Vercel, we cannot run NVIDIA Riva ASR (gRPC). When you self-host Riva
-and set ``RIVA_ASR_URL``, swap the body of ``score_pronunciation`` to call
-the Riva proxy and use real word-level confidence scores.
-
-This default implementation is a transparent heuristic:
-- If the client sends a ``confidence_map`` (from on-device ASR), use it.
-- Otherwise, return a neutral score with words marked green.
-
-The heuristic is intentionally honest — it does not pretend to be a real
-pronunciation score. It exists so the rest of the pipeline (and the Android
-UI's color-coded word display) keeps working in development.
 """
-from __future__ import annotations
+Pronunciation scoring tool.
 
-from typing import Any
+This is deliberately NOT LLM-based -- pronunciation quality can't be
+judged from text alone, only from audio. Cerebras has no ASR/TTS
+service, so real pronunciation confidence must come from the Android
+client's on-device `SpeechRecognizer`, which can report a per-utterance
+(and on some devices per-word) confidence value. When the client
+supplies a `confidence_map` (word -> 0.0-1.0 confidence) inside
+`user_profile`, we scale those confidences directly into 0-100 scores.
 
-from app.schemas import PronunciationFeedback
+When no `confidence_map` is available (e.g. during early integration,
+testing, or on devices whose ASR doesn't expose confidences), we fall
+back to a transparent, deterministic PLACEHOLDER heuristic based on
+word length and vowel count, clamped into [70, 95] so it never looks
+alarmingly bad or suspiciously perfect. This heuristic carries no
+linguistic meaning about actual pronunciation quality -- it exists
+purely so the UI has *something* stable to render in a demo before
+real ASR confidences are wired up. It is designed to be a drop-in
+swap point for a real scorer (e.g. NVIDIA Riva pronunciation
+assessment) in the future.
+"""
+
+from app.schemas import PronunciationFeedback, PronunciationWordScore
 
 
-def _color_for(score: int) -> str:
+def _color_for_score(score: float) -> str:
     if score >= 85:
         return "green"
     if score >= 65:
@@ -27,36 +32,45 @@ def _color_for(score: int) -> str:
     return "red"
 
 
-def _heuristic_score(word: str, idx: int) -> int:
-    base = 85 - max(0, len(word) - 6)
-    vowels = sum(1 for c in word.lower() if c in "aeiou")
-    base += min(5, vowels)
-    return max(70, min(95, base))
+def _placeholder_word_score(word: str) -> float:
+    """Deterministic pseudo-score based on word shape. NOT a real pronunciation
+    measure -- see module docstring. Clamped to [70, 95]."""
+    letters = [c for c in word.lower() if c.isalpha()]
+    if not letters:
+        return 80.0
+    vowels = sum(1 for c in letters if c in "aeiou")
+    length_factor = min(len(letters), 12) / 12.0
+    vowel_ratio = vowels / max(len(letters), 1)
+    raw = 70 + (length_factor * 15) + (vowel_ratio * 10)
+    return max(70.0, min(95.0, round(raw, 1)))
 
 
 async def score_pronunciation(
     transcript: str,
-    confidence_map: dict[str, float] | None = None,
+    confidence_map: dict | None = None,
 ) -> PronunciationFeedback:
-    transcript = transcript.strip()
-    if not transcript:
-        return PronunciationFeedback(overall_score=100, words=[])
+    """Score each word in the transcript, using real ASR confidences if
+    available, otherwise a transparent placeholder heuristic. Never raises."""
+    try:
+        words = transcript.split()
+        if not words:
+            return PronunciationFeedback(overall_score=0.0, words=[])
 
-    words: list[dict[str, Any]] = []
-    scores: list[int] = []
+        scored: list[PronunciationWordScore] = []
+        for word in words:
+            if confidence_map and word in confidence_map:
+                score = max(0.0, min(1.0, float(confidence_map[word]))) * 100
+            else:
+                score = _placeholder_word_score(word)
+            scored.append(
+                PronunciationWordScore(
+                    word=word,
+                    score=round(score, 1),
+                    color=_color_for_score(score),
+                )
+            )
 
-    for idx, word in enumerate(transcript.split()):
-        word_clean = word.strip(".,!?;:\"'()[]").lower()
-        if not word_clean:
-            continue
-
-        if confidence_map and word_clean in confidence_map:
-            score = int(round(confidence_map[word_clean] * 100))
-        else:
-            score = _heuristic_score(word_clean, idx)
-
-        scores.append(score)
-        words.append({"word": word, "score": score, "color": _color_for(score)})
-
-    overall = sum(scores) // len(scores) if scores else 80
-    return PronunciationFeedback(overall_score=overall, words=words)
+        overall = round(sum(w.score for w in scored) / len(scored), 1)
+        return PronunciationFeedback(overall_score=overall, words=scored)
+    except Exception:
+        return PronunciationFeedback(overall_score=75.0, words=[])

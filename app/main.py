@@ -1,8 +1,15 @@
-"""FastAPI application factory.
-
-The Vercel entry point (``api/index.py``) imports ``app`` from this module.
 """
-from __future__ import annotations
+FastAPI application factory for the VocaLume backend.
+
+`create_app()` assembles the FastAPI instance: it configures CORS from
+`Settings.allowed_origins`, mounts the health, chat, and session
+routers, and registers a startup event that logs whether the Cerebras
+API key is configured (a missing/invalid key is not fatal at startup
+-- it only causes 500s from routes that actually need to call the
+LLM -- but logging it loudly here makes misconfiguration obvious in
+Vercel's function logs immediately after a deploy). The module-level
+`app` object is what `api/index.py` re-exports for Vercel to serve.
+"""
 
 import logging
 
@@ -10,29 +17,24 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
-from app.config import settings
+from app.config import get_settings
 from app.routers import chat, health, session
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-)
-log = logging.getLogger("vocalume")
+logger = logging.getLogger("vocalume")
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(
+    """Build and configure the VocaLume FastAPI application."""
+    settings = get_settings()
+
+    application = FastAPI(
         title="VocaLume API",
-        description=(
-            "Real-time English speaking coach backend. LangChain + LangGraph "
-            "orchestration over NVIDIA NIM LLM. Designed for Vercel serverless."
-        ),
         version=__version__,
         docs_url="/docs",
         redoc_url="/redoc",
     )
 
-    app.add_middleware(
+    application.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
         allow_credentials=True,
@@ -40,21 +42,24 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    app.include_router(health.router)
-    app.include_router(chat.router)
-    app.include_router(session.router)
+    application.include_router(health.router)
+    application.include_router(chat.router)
+    application.include_router(session.router)
 
-    @app.on_event("startup")
-    async def _on_startup() -> None:
-        if not settings.nim_configured:
-            log.warning(
-                "NVIDIA_API_KEY not configured — LLM endpoints will return "
-                "errors. Set it in .env (local) or Vercel env vars (prod)."
+    @application.on_event("startup")
+    async def _log_startup_config() -> None:
+        if settings.cerebras_configured:
+            logger.info(
+                "VocaLume backend starting with Cerebras model '%s'.",
+                settings.cerebras_model,
             )
         else:
-            log.info("VocaLume API starting  ·  NIM model: %s", settings.nim_llm_model)
+            logger.warning(
+                "CEREBRAS_API_KEY is not configured (or does not start with "
+                "'csk-'). Chat endpoints will fail until it is set."
+            )
 
-    return app
+    return application
 
 
 app = create_app()

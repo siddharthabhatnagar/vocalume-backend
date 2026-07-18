@@ -1,104 +1,96 @@
-"""Grammar correction tool."""
-from __future__ import annotations
+"""
+Grammar correction tool.
+
+Uses the Cerebras analyzer chat (low temperature, JSON-only output) to
+detect and correct grammar mistakes in a learner's transcript. The
+prompt strictly demands a JSON object with no markdown fences and no
+commentary, since the Cerebras/Llama model can otherwise wrap its
+answer in prose or code fences. Parsing is tolerant: we strip common
+code-fence wrappers and, if `json.loads` still fails, fall back to a
+regex extraction of the first `{...}` block. If everything fails (bad
+JSON, network error, missing API key), we return a no-op
+`GrammarFeedback` marking the utterance as correct with zero errors,
+since a broken grammar tool should never prevent the rest of the
+conversation pipeline from responding to the learner.
+"""
 
 import json
-import logging
 import re
-from typing import Any
-
-from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.schemas import GrammarError, GrammarErrorType, GrammarFeedback
-from app.services.nim_llm import get_analyzer_chat
+from app.services.cerebras_llm import get_analyzer_chat
 
-log = logging.getLogger(__name__)
+_SYSTEM_PROMPT = """You are an English grammar correction engine for a language-learning app.
+Given a learner's spoken utterance (transcribed to text), identify grammar mistakes and provide a corrected version.
 
-SYSTEM_PROMPT = """You are a strict grammar checker for English learners.
-
-You will receive ONE user utterance. Output ONLY a JSON object with this exact
-shape — no commentary, no markdown fences:
-
+Output ONLY a JSON object -- no markdown fences, no commentary, no explanation outside the JSON. The JSON must have this exact shape:
 {
-  "corrected": "<the grammatically correct version of the utterance>",
-  "is_correct": <true if no correction was needed>,
+  "corrected": "<the fully corrected sentence>",
+  "is_correct": <true|false>,
   "errors": [
     {
       "type": "<one of: tense, article, preposition, subject_verb_agreement, word_order, word_choice, punctuation, other>",
-      "original": "<the incorrect fragment, verbatim from the user>",
+      "original": "<the incorrect fragment>",
       "correction": "<the corrected fragment>",
-      "explanation": "<one short sentence explaining the fix>"
+      "explanation": "<brief, learner-friendly explanation>"
     }
   ]
 }
 
-Rules:
-- Preserve the user's meaning and tone. Do not rewrite idiomatic phrases.
-- If the user's utterance is already correct, set is_correct=true and errors=[].
-- Never invent errors. If you are unsure, do not flag it.
-- Keep "corrected" close to the original — fix only what is genuinely wrong.
-"""
+If the utterance has no grammar errors, return "is_correct": true and an empty "errors" list."""
 
 
-def _strip_code_fence(text: str) -> str:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*\n", "", text)
-        text = re.sub(r"\n```\s*$", "", text)
-    return text.strip()
-
-
-def _safe_parse(raw: str) -> dict[str, Any]:
-    cleaned = _strip_code_fence(raw)
+def _extract_json(raw: str) -> dict:
+    """Tolerantly parse a JSON object out of an LLM response string."""
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+        cleaned = re.sub(r"```$", "", cleaned).strip()
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                pass
-    return {}
-
-
-def _validate(data: dict[str, Any], original: str) -> GrammarFeedback:
-    if not isinstance(data, dict) or "corrected" not in data:
-        return GrammarFeedback(original=original, corrected=original, is_correct=True, errors=[])
-
-    errors: list[GrammarError] = []
-    for raw_err in data.get("errors", []) or []:
-        try:
-            err_type = GrammarErrorType(raw_err.get("type", "other"))
-        except ValueError:
-            err_type = GrammarErrorType.OTHER
-        errors.append(
-            GrammarError(
-                type=err_type,
-                original=raw_err.get("original", ""),
-                correction=raw_err.get("correction", ""),
-                explanation=raw_err.get("explanation", ""),
-            )
-        )
-
-    corrected = data.get("corrected", original) or original
-    is_correct = bool(data.get("is_correct", corrected == original))
-
-    return GrammarFeedback(original=original, corrected=corrected, is_correct=is_correct, errors=errors)
+            return json.loads(match.group(0))
+        raise
 
 
 async def correct_grammar(transcript: str) -> GrammarFeedback:
-    transcript = transcript.strip()
-    if not transcript:
-        return GrammarFeedback(original="", corrected="", is_correct=True, errors=[])
+    """Run the grammar-correction LLM call and return structured feedback.
 
-    chat = get_analyzer_chat()
+    Never raises: on any failure, returns a no-op GrammarFeedback with
+    is_correct=True and an empty errors list.
+    """
     try:
+        chat = get_analyzer_chat()
         response = await chat.ainvoke(
-            [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=f'Utterance: "{transcript}"')]
+            [
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": transcript},
+            ]
         )
-        raw = response.content if isinstance(response.content, str) else str(response.content)
-        parsed = _safe_parse(raw)
-        return _validate(parsed, transcript)
-    except Exception as exc:
-        log.warning("Grammar correction failed: %s", exc)
-        return GrammarFeedback(original=transcript, corrected=transcript, is_correct=True, errors=[])
+        parsed = _extract_json(response.content)
+
+        errors = [
+            GrammarError(
+                type=GrammarErrorType(e.get("type", "other")),
+                original=e.get("original", ""),
+                correction=e.get("correction", ""),
+                explanation=e.get("explanation", ""),
+            )
+            for e in parsed.get("errors", [])
+        ]
+
+        return GrammarFeedback(
+            original=transcript,
+            corrected=parsed.get("corrected", transcript),
+            is_correct=bool(parsed.get("is_correct", len(errors) == 0)),
+            errors=errors,
+        )
+    except Exception:
+        return GrammarFeedback(
+            original=transcript,
+            corrected=transcript,
+            is_correct=True,
+            errors=[],
+        )
