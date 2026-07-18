@@ -4,7 +4,10 @@
     {
       "src": "api/index.py",
       "use": "@vercel/python",
-      "config": { "includeFiles": "app/**", "maxDuration": 300 }
+      "config": {
+        "includeFiles": "**/*.py",
+        "maxDuration": 300
+      }
     }
   ],
   "routes": [

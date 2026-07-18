@@ -1,10 +1,4 @@
-"""CEFR level classifier.
-
-Few-shot prompted classifier that estimates the CEFR level (A1–C2) of a
-single learner utterance. The output is smoothed against the client's
-current level so a single short or unusually simple utterance does not
-cause wild swings in difficulty.
-"""
+"""CEFR level classifier."""
 from __future__ import annotations
 
 import json
@@ -34,9 +28,9 @@ Output ONLY a JSON object — no markdown fences, no commentary:
 }
 
 Examples:
-- "Hello, my name is John. I am student." → {"level": "A2", "confidence": 0.85, "reasoning": "Simple sentence structure with article error."}
-- "I've been working on this project for two years, which has given me considerable insight into the domain." → {"level": "C1", "confidence": 0.9, "reasoning": "Present perfect continuous, relative clause, sophisticated vocabulary."}
-- "The thing is, like, you know, it depends." → {"level": "B1", "confidence": 0.6, "reasoning": "Conversational fillers, no complex grammar."}
+- "Hello, my name is John. I am student." -> {"level": "A2", "confidence": 0.85, "reasoning": "Simple sentence structure with article error."}
+- "I've been working on this project for two years, which has given me considerable insight into the domain." -> {"level": "C1", "confidence": 0.9, "reasoning": "Present perfect continuous, relative clause, sophisticated vocabulary."}
+- "The thing is, like, you know, it depends." -> {"level": "B1", "confidence": 0.6, "reasoning": "Conversational fillers, no complex grammar."}
 """
 
 VALID_LEVELS = {level.value for level in CEFRLevel}
