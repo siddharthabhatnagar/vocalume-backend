@@ -1,0 +1,1 @@
+"""VocaLume services — external AI clients."""
