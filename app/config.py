@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     max_history_turns: int = Field(default=10, alias="MAX_HISTORY_TURNS")
 
     allowed_origins_raw: str = Field(default="*", alias="ALLOWED_ORIGINS")
+    firebase_service_account_json: str = Field(default="", alias="FIREBASE_SERVICE_ACCOUNT_JSON")
 
     @property
     def allowed_origins(self) -> list[str]:
